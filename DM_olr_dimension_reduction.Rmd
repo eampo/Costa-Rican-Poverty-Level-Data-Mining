@@ -1,0 +1,440 @@
+---
+title: "DM_Project"
+author: "Elijah Ampo"
+date: "8/20/2018"
+output: html_document
+---
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(factoextra)
+library(MASS)
+require(foreign)
+require(reshape2)
+require(foreign)
+require(nnet)
+require(reshape2)
+library(poLCA)
+library(gridExtra)
+```
+
+
+```{r}
+#Read in data
+costarican <- read.csv("train.csv")
+#subset dataframe that has household head is 1
+costarican <- costarican[which(costarican$parentesco1=="1"),]
+```
+
+```{r}
+#Impute missing Values
+costarican['v2a1'][is.na(costarican['v2a1'])] <- 0 #impute 0s for Monthly Rent column
+costarican['meaneduc'][is.na(costarican['meaneduc'])] <- costarican['escolari'][is.na(costarican['meaneduc'])] #Impute using the record's escolari' variable as replacement for NA value
+costarican['SQBmeaned'][is.na(costarican['SQBmeaned'])] <- costarican['escolari'][is.na(costarican['SQBmeaned'])] #Impute using the record's escolari' variable (squared) as replacement for NA value
+```
+
+```{r}
+#Data cleaning
+#Function to create factor variables
+combine.vars<-function(data=costarican,cols){
+        as.factor(apply((as.matrix(data[,cols],ncol=length(cols),byrow=TRUE)%*%matrix(seq_along(cols))),1,max))
+}
+
+#id of each household
+id <- costarican[,96]
+
+#independent variables,factor
+Outside_Wall_Material <- combine.vars(data=costarican,cols=24:31)
+Floor_Material <- combine.vars(data=costarican,cols=32:37)
+Roof_Material <- combine.vars(data=costarican,cols=38:41)
+#there should be 4 levels but we have 5 in the results instead, because there are individuals who do not belong to any of the groups
+
+Water_Provision <- combine.vars(data=costarican,cols=43:45)
+Electricity <- combine.vars(data=costarican,cols=46:49)
+#5 levels because there are individuals who belong to neither group
+
+Toilet <- combine.vars(data=costarican,cols=50:54)
+Source_of_Energy_for_Cooking <- combine.vars(data=costarican,cols=55:58)
+Rubbish_Disposal <- combine.vars(data=costarican,cols=59:64)
+
+#there should be 6 levels but we have 5 instead, because no observation falls in column 63
+Wall_Condition <- combine.vars(data=costarican,cols=65:67)
+Roof_Condition<-combine.vars(data=costarican,cols=68:70)
+Floor_Condition<-combine.vars(data=costarican,cols=71:73)
+Housing_Status<-combine.vars(data=costarican,cols=116:120)
+Region<-combine.vars(data=costarican,cols=125:130)
+Area<-combine.vars(data=costarican,cols=131:132)
+
+#dependent variable
+Poverty <- combine.vars(data=costarican,cols=143)
+
+#binary variables
+Over_Crowding <-combine.vars(data=costarican,cols=5)
+Has_Bathroom<-combine.vars(data=costarican,cols=6)
+Has_Refrig<-combine.vars(data=costarican,cols=7)
+Has_ceiling<-combine.vars(data=costarican,cols=42)
+Disability<-combine.vars(data=costarican,cols=74)
+Is_Male <- combine.vars(data=costarican,cols=75)
+Has_Television <- combine.vars(data=costarican,cols=122)
+
+#not needed
+Age<-costarican[,133]#has SQ form so only SQ form used
+Years_of_Schooling<-costarican[,21]#has SQ form so only SQ form used
+Dependency<-costarican[,101]#has SQ form so only SQ form used
+
+#create new dataframe for LCA
+Costarican.data <- cbind.data.frame(id, Poverty,Outside_Wall_Material,Floor_Material,Roof_Material,Water_Provision,Electricity,Toilet,Source_of_Energy_for_Cooking,Rubbish_Disposal,Wall_Condition,Roof_Condition,Floor_Condition,Housing_Status,Region,Area,Over_Crowding,Has_Bathroom,Has_Refrig,Has_ceiling,Disability,Is_Male,Has_Television)
+
+#Selected Numeric Variables for PCA
+Rent <- costarican[,2]
+Rooms<-costarican[,4]
+Males<-costarican[,12]
+Mobilephone <- costarican[,124]
+SQ_years_of_schooling<-costarican[,134]
+SQ_age<-costarican[,135]
+SQ_dependency<-costarican[,140]
+SQ_hhsize <- costarican[,136]
+SQ_years_of_schooling_male_head <- costarican[,137]
+SQ_hhsize_children <- costarican[,138]
+SQ_overcrowding <- costarican[,139]
+SQ_meaned <- costarican[,141]
+
+#create new dataframe (numerical variables) for PCA
+Costarican.pca.data <- cbind.data.frame(Poverty, id, Rent,Rooms,Males,Mobilephone,SQ_years_of_schooling,SQ_age,SQ_dependency,SQ_hhsize,SQ_years_of_schooling_male_head, SQ_hhsize_children, SQ_overcrowding, SQ_meaned)
+```
+
+```{r}
+#split train and test
+set.seed(1122) 
+sample_size <- floor(0.7 * nrow(Costarican.data)) 
+train <- sample(seq_len(nrow(Costarican.data)), size = sample_size) 
+costarican_train<-Costarican.data[train,] 
+costarican_test<-Costarican.data[-train,]
+costarican_test<-Costarican.data[-train,][,c(2:23)]
+
+#resample train data
+set.seed(1122)
+factor_count <- count(costarican_train, Poverty)
+up_sample <- (costarican_train %>% group_by(Poverty) %>% sample_n(size=max(factor_count$n),replace=T))
+```
+
+```{r include=FALSE}
+#Latent Class Analysis
+f <- cbind(Poverty, Outside_Wall_Material, Floor_Material, Roof_Material, Water_Provision, Electricity, Toilet, Source_of_Energy_for_Cooking, Rubbish_Disposal, Wall_Condition, Roof_Condition, Floor_Condition, Housing_Status, Region, Area, Over_Crowding, Has_Bathroom, Has_Refrig, Has_ceiling, Disability, Is_Male, Has_Television) ~ 1
+
+aic.model <- numeric(5)
+bic.model <- numeric(5)
+
+for(i in 2:6){
+  lc <- poLCA(f, up_sample, nclass=i, maxiter=3000, 
+              tol=1e-5, na.rm=FALSE,  
+              nrep=100, verbose=TRUE, calc.se=TRUE)
+  aic.model[i] <- lc$aic
+  bic.model[i] <- lc$bic
+  }
+```
+
+```{r}
+AIC <- as.data.frame(x = aic.model)
+Classes <- c(2,3,4,5,6)
+matplot(Classes, AIC[2:6, c("aic.model")], type="l",col=c("green"),xlab = "Number of Classes",ylab = "AIC")
+
+BIC <- as.data.frame(x = bic.model)
+Classes <- c(2,3,4,5,6)
+matplot(Classes, BIC[2:6, c("bic.model")], type="l",col=c("red"),xlab = "Number of Classes",ylab = "BIC")
+```
+
+```{r include=FALSE}
+#LCA with upsampled train data
+lca.four.upsample <- poLCA(f, up_sample, nclass=4, maxiter=3000, 
+              tol=1e-5, na.rm=FALSE,  
+              nrep=100, verbose=TRUE, calc.se=TRUE)
+
+#Save LCA class probabilities
+lca.post <- lca.four.upsample$posterior #lca class probabilities for modeling
+
+##Note: Did not conduct holdout validation bc lca for train population and lca for test population will show different results. Not sure how to account for that.
+
+#LCA with original train data (for data visualizations of true population)
+#Also, class probabilities on this lca model (data w no upsampling) will be used for comparison later.
+lca.four <- poLCA(f, costarican_train, nclass=4, maxiter=3000, 
+              tol=1e-5, na.rm=FALSE,  
+              nrep=100, verbose=TRUE, calc.se=TRUE)
+```
+
+```{r}
+#LCA Visualizations - Item Class Probabilities 
+#Poverty
+poverty.class.four <- as.data.frame(lca.four$probs[1])
+colnames(poverty.class.four) <- c("Extreme","Moderate","Non-vulnerable","Vulnerable")
+poverty.class.four.melt <- melt(as.matrix(poverty.class.four))
+ggplot(data=poverty.class.four.melt, aes(x=Var1, y=value, fill = Var2)) +
+  geom_bar(stat="identity")
+
+#Outside Wall Material
+outside.wall.material <- as.matrix(as.data.frame(lca.four$probs[2]))
+colnames(outside.wall.material) <- c("block/brick","socket (wood, asbestos)","cement","waste material","wood","zink","natural fibers","other")
+outside.wall.material.melt <- melt(outside.wall.material)
+ggplot(data=outside.wall.material.melt, aes(x=Var1, y=value, fill = Var2)) +
+  geom_bar(stat="identity")
+
+#Floor Material
+floor.material <- as.matrix(as.data.frame(lca.four$probs[3]))
+colnames(floor.material) <- c("mosaic,ceramic,terrazo","cement","other","natural material","no floor", "wood")
+floor.material.melt <- melt(floor.material)
+ggplot(data=floor.material.melt, aes(x=Var1, y=value, fill = Var2)) +
+  geom_bar(stat="identity")
+
+#Roof Material
+roof.material <- as.matrix(as.data.frame(lca.four$probs[4]))
+colnames(roof.material) <- c("NA","Metal Foil/Zink","Fiber Cement/Mezzanine","Natural Fibers","Other")
+roof.material.melt <- melt(roof.material)
+ggplot(data=roof.material.melt, aes(x=Var1, y=value, fill = Var2)) +
+  geom_bar(stat="identity")
+
+#Water Provision
+water.provision <- as.matrix(as.data.frame(lca.four$probs[5]))
+colnames(water.provision) <- c("inside dwelling","outside dwelling","no water provision")
+water.provision.melt <- melt(water.provision)
+ggplot(data=water.provision.melt, aes(x=Var1, y=value, fill = Var2)) +
+  geom_bar(stat="identity")
+
+#Electricity
+electricity <- as.matrix(as.data.frame(lca.four$probs[6]))
+colnames(electricity) <- c("NA","CNFL/ICE/ESPH/JASEC","Private Plant","No Electricity","Cooperative")
+electricity.melt <- melt(electricity)
+ggplot(data=electricity.melt, aes(x=Var1, y=value, fill = Var2)) +
+  geom_bar(stat="identity")
+
+#Toilet
+toilet <- as.matrix(as.data.frame(lca.four$probs[7]))
+colnames(toilet)<- c("NA","Sewer System","Septic Tank","Black hole/Letrine","Other system")
+toilet.melt <- melt(toilet)
+ggplot(data=toilet.melt, aes(x=Var1, y=value, fill = Var2)) +
+  geom_bar(stat="identity")
+
+#Cooking
+cooking <- as.matrix(as.data.frame(lca.four$probs[8]))
+colnames(cooking) <- c("no kitchen","electricity","cooking gas","wood charcoal")
+cooking.melt <- melt(cooking)
+ggplot(data=cooking.melt, aes(x=Var1, y=value, fill = Var2)) +
+  geom_bar(stat="identity")
+
+#Rubbish Disposal
+rubbish <- as.matrix(as.data.frame(lca.four$probs[9]))
+colnames(rubbish) <- c("tanker truck","hollow/buried","burning", "throwing in unoccupied space","other")
+rubbish.melt <- melt(rubbish)
+ggplot(data=rubbish.melt, aes(x=Var1, y=value, fill = Var2)) +
+  geom_bar(stat="identity")
+
+#Wall Condition
+wall.condition <- as.matrix(as.data.frame(lca.four$probs[10]))
+colnames(wall.condition) <- c("bad","regular","good")
+wall.condition.melt <- melt(wall.condition)
+ggplot(data=wall.condition.melt, aes(x=Var1, y=value, fill = Var2)) +
+  geom_bar(stat="identity")
+
+#Roof Condition
+roof.condition <- as.matrix(as.data.frame(lca.four$probs[11]))
+colnames(roof.condition) <- c("bad","regular","good")
+roof.condition.melt <- melt(roof.condition)
+ggplot(data=roof.condition.melt, aes(x=Var1, y=value, fill = Var2)) +
+  geom_bar(stat="identity")
+
+#Floor Condition
+floor.condition <- as.matrix(as.data.frame(lca.four$probs[12]))
+colnames(floor.condition) <- c("bad","regular","good")
+floor.condition.melt <- melt(floor.condition)
+ggplot(data=floor.condition.melt, aes(x=Var1, y=value, fill = Var2)) +
+  geom_bar(stat="identity")
+
+#Housing Status
+housing.status <- as.matrix(as.data.frame(lca.four$probs[13]))
+colnames(housing.status) <- c("fully paid","installment payments","rented","precarious","other (assigned/borrowed)")
+housing.status.melt <- melt(housing.status)
+ggplot(data=housing.status.melt, aes(x=Var1, y=value, fill = Var2)) +
+  geom_bar(stat="identity")
+
+#Region
+region <- as.matrix(as.data.frame(lca.four$probs[14]))
+colnames(region)<- c("Central","Chorotega","Pacaficico Central","Brunca","Huetar Atlafaintica","Huegar Norte")
+region.melt <- melt(region)
+ggplot(data=region.melt, aes(x=Var1, y=value, fill = Var2)) +
+  geom_bar(stat="identity")
+
+#Overcrowding
+area <- as.matrix(as.data.frame(lca.four$probs[15]))
+colnames(area) <- c("urban","rural")
+area.melt <- melt(area)
+ggplot(data=area.melt, aes(x=Var1, y=value, fill = Var2)) +
+  geom_bar(stat="identity")
+
+#Overcrowding
+overcrowding <- as.matrix(as.data.frame(lca.four$probs[16]))
+colnames(overcrowding) <- c("no overcrowding","overcrowding")
+overcrowding.melt <- melt(overcrowding)
+ggplot(data=overcrowding.melt, aes(x=Var1, y=value, fill = Var2)) +
+  geom_bar(stat="identity")
+
+#Bathroom
+bathroom <- as.matrix(as.data.frame(lca.four$probs[17]))
+colnames(bathroom) <- c("no bathroom","has bathroom")
+bathroom.melt <- melt(bathroom)
+ggplot(data=bathroom.melt, aes(x=Var1, y=value, fill = Var2)) +
+  geom_bar(stat="identity")
+
+#Refrigerator
+refrigerator <- as.matrix(as.data.frame(lca.four$probs[18]))
+colnames(refrigerator) <- c("no refrigerator","has refrigerator")
+refrigerator.melt <- melt(refrigerator)
+ggplot(data=refrigerator.melt, aes(x=Var1, y=value, fill = Var2)) +
+  geom_bar(stat="identity")
+
+#Ceiling
+ceiling <- as.matrix(as.data.frame(lca.four$probs[19]))
+colnames(ceiling)<- c("no ceiling","has ceiling")
+ceiling.melt <- melt(ceiling)
+ggplot(data=ceiling.melt, aes(x=Var1, y=value, fill = Var2)) +
+  geom_bar(stat="identity")
+
+#Disability
+disability <- as.matrix(as.data.frame(lca.four$probs[20]))
+colnames(disability) <- c("not disabled","disabled")
+disability.melt <- melt(disability)
+ggplot(data=disability.melt, aes(x=Var1, y=value, fill = Var2)) +
+  geom_bar(stat="identity")
+
+#Male
+male <- as.matrix(as.data.frame(lca.four$probs[21]))
+colnames(male) <- c("not male", "male")
+male.melt <- melt(male)
+ggplot(data=male.melt, aes(x=Var1, y=value, fill = Var2)) +
+  geom_bar(stat="identity")
+
+#Television
+television <- as.matrix(as.data.frame(lca.four$probs[22]))
+colnames(television) <- c("no telivision","has television")
+television.melt <- melt(television)
+ggplot(data=television.melt, aes(x=Var1, y=value, fill = Var2)) +
+  geom_bar(stat="identity")
+```
+
+```{r}
+#Principal Component Analysis
+
+#create train and test data
+costarican_pca_train<-Costarican.pca.data[train,] 
+costarican_pca_test<- Costarican.pca.data[-train,]
+costarican_pca_test<- costarican_pca_test[,c(3:14)]
+
+##TRAIN DATA
+#resample pca train data (upsampling method)
+set.seed(1122)
+factor_count <- count(costarican_pca_train, Poverty)
+up_sample.pca.1 <- (costarican_pca_train %>% group_by(Poverty) %>% sample_n(size=max(factor_count$n),replace=T))
+up_sample.pca <- up_sample.pca.1[,c(3:14)]
+
+#TEST DATA
+means <- apply(up_sample.pca, 2, function(x) mean(x))
+sd <- apply(up_sample.pca, 2, function(x) sd(x))
+
+costarican_pca_test$Rent <- (costarican_pca_test$Rent-means[1])/sd[1]
+costarican_pca_test$Rooms <- (costarican_pca_test$Rent-means[2])/sd[2]
+costarican_pca_test$Males <- (costarican_pca_test$Rent-means[3])/sd[3]
+costarican_pca_test$Mobilephone <- (costarican_pca_test$Rent-means[4])/sd[4]
+costarican_pca_test$SQ_years_of_schooling <- (costarican_pca_test$Rent-means[5])/sd[5]
+costarican_pca_test$SQ_age <- (costarican_pca_test$Rent-means[6])/sd[6]
+costarican_pca_test$SQ_dependency <- (costarican_pca_test$Rent-means[7])/sd[7]
+costarican_pca_test$SQ_hhsize <- (costarican_pca_test$Rent-means[8])/sd[8]
+costarican_pca_test$SQ_years_of_schooling_male_head <- (costarican_pca_test$Rent-means[9])/sd[9]
+costarican_pca_test$SQ_hhsize_children <- (costarican_pca_test$Rent-means[10])/sd[10]
+costarican_pca_test$SQ_overcrowding <- (costarican_pca_test$Rent-means[11])/sd[11]
+costarican_pca_test$SQ_meaned<- (costarican_pca_test$Rent-means[12])/sd[12]
+```
+
+```{r}
+#Conduct PCA on upsampled data
+pca.train.scaled <- scale(x = up_sample.pca,center = TRUE,scale = TRUE)
+pca.train <- princomp(pca.train.scaled, scale. = TRUE)
+```
+
+```{r}
+#PCA Visualizations
+
+#Scree Plot PCA VAF
+VAF <- (pca.train$sdev)^2/sum((pca.train$sdev)^2)
+VAF.cumsum <- cumsum(VAF)
+plot(VAF.cumsum, main = "Scree Plot", xlab = "Components", 
+     ylab = "VAF", type = "b", col = "green")
+
+#Keeping PC1 - PC6
+pca.comp <- pca.train$scores[,c(1:6)] #pca
+
+#Biplots
+fviz_pca_biplot(X = pca.train, axes = c(1,2),labelsize = 4, geom = c("point"),pointsize = .6) #PC1 vs PC2
+fviz_pca_biplot(X = pca.train, axes = c(1,3),labelsize = 4, geom = c("point"),pointsize = .6) #PC1 vs PC3
+fviz_pca_biplot(X = pca.train, axes = c(1,4),labelsize = 4, geom = c("point"),pointsize = .6) #PC1 vs PC4
+fviz_pca_biplot(X = pca.train, axes = c(1,5),labelsize = 4, geom = c("point"),pointsize = .6) #PC1 vs PC5
+fviz_pca_biplot(X = pca.train, axes = c(1,6),labelsize = 4, geom = c("point"),pointsize = .6) #PC1 vs PC6
+
+#Factor Loadings
+matplot(1:12, pca.train$loadings[,1:6], type = 'b')
+abline(h=0)
+```
+
+```{r}
+#PCA Holdout Validation
+costarican.test.validation <- predict(pca.train, newdata = costarican_pca_test)
+manual.test <- costarican.test.validation[,1:6] %*% t(pca.train$loadings[,1:6])
+test.data.cor <- round(cor(as.vector(costarican_pca_test), manual.test),2)
+test.data.cor
+```
+
+
+
+```{r}
+#MODEL BUILDING
+
+#Concatenate new predictors (LCA class probabilities and PCA component scores (PC1 - PC6))
+#new train data
+model.dat <- cbind.data.frame(up_sample$Poverty,lca.post,pca.comp)
+colnames(model.dat) <- c("Poverty","LCA1","LCA2","LCA3","LCA4","PCA1","PCA2","PCA3","PCA4","PCA5","PCA6")
+
+#skipping hold out validation. Unsure how to get lca probs for test data 
+```
+
+```{r}
+#OLR
+fit.olr <- polr(Poverty ~ ., data = model.dat, Hess = TRUE)
+step(fit.olr, type = "both")
+fit.olr.best <- polr(formula = Poverty ~ LCA1 + LCA3 + PCA2 + PCA3 + PCA4, data = model.dat, 
+    Hess = TRUE) #from step function
+
+fit.olr.pred <- predict(fit.olr,type="class")
+fit.olr.best.pred <- predict(fit.olr.best,type="class")
+round(prop.table(table(fit.olr.pred,model.dat$Poverty)),3)
+```
+
+```{r}
+#Create OLR model with original data (no upsampling)
+
+#LCA class probabilities from lca.four model (lca with orig data)
+lca.post2 <- lca.four$posterior #save lca class probabilities
+
+#PCA with no upsampled data
+pca.train.scaled.2 <- scale(x = costarican_pca_train[,c(3:14)],center = TRUE,scale = TRUE)
+pca.train.2 <- princomp(pca.train.scaled.2, scale. = TRUE)
+pca.comp2 <- pca.train.2$scores[,c(1:6)] #save component scores
+
+##Concatenate new predictors (LCA class probabilities and PCA component scores (PC1 - PC6)) - no upsampling
+model.dat.2 <- cbind.data.frame(costarican_train$Poverty,lca.post2,pca.comp2)
+colnames(model.dat.2) <- c("Poverty","LCA1","LCA2","LCA3","LCA4","PCA1","PCA2","PCA3","PCA4","PCA5","PCA6")
+
+#OLR - no upsampled data
+x.2 <- polr(Poverty ~ ., data = model.dat.2, Hess = TRUE)
+olr.probs.2 <- as.data.frame(x.2$fitted.values)
+olr.pred.2 <- as.factor(colnames(olr.probs.2)[max.col(olr.probs.2,ties.method="first")])
+
+round(prop.table(table(olr.pred.2,model.dat.2$Poverty)),3)
+```
